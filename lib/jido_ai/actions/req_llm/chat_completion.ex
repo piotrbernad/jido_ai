@@ -244,9 +244,9 @@ defmodule Jido.AI.Actions.ReqLlm.ChatCompletion do
           tool_specs =
             Enum.map(tools, fn tool ->
               %{
-                name: tool.name,
-                description: Map.get(tool, :description, ""),
-                parameters: Map.get(tool, :parameters, %{})
+                name: tool.name()
+                description: tool.description(),
+                parameters: tool.parameters()
               }
             end)
 
