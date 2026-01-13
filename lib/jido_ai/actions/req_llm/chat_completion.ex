@@ -491,12 +491,27 @@ defmodule Jido.AI.Actions.ReqLlm.ChatCompletion do
     tool_calls = ReqLLM.Response.tool_calls(response) || []
 
     formatted_tools =
-      Enum.map(tool_calls, fn tool ->
-        %{
-          name: tool[:name] || tool["name"],
-          arguments: tool[:arguments] || tool["arguments"],
-          result: nil
-        }
+      Enum.map(tool_calls, fn
+        # Handle ReqLLM.ToolCall struct
+        %ReqLLM.ToolCall{} = tool_call ->
+          %{
+            name: ReqLLM.ToolCall.name(tool_call),
+            arguments: ReqLLM.ToolCall.args_map(tool_call) || %{},
+            result: nil
+          }
+
+        # Handle map format (backward compatibility)
+        tool when is_map(tool) ->
+          %{
+            name: tool[:name] || tool["name"] || Map.get(tool, :name, ""),
+            arguments: tool[:arguments] || tool["arguments"] || Map.get(tool, :arguments, %{}),
+            result: nil
+          }
+
+        # Fallback for any other format
+        other ->
+          Logger.warning("Unexpected tool call format: #{inspect(other, limit: 3)}")
+          %{name: "", arguments: %{}, result: nil}
       end)
 
     {:ok, %{content: content, tool_results: formatted_tools}}
