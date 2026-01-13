@@ -237,24 +237,25 @@ defmodule Jido.AI.Actions.ReqLlm.ChatCompletion do
       |> add_opt_if_present(:presence_penalty, params.presence_penalty)
 
     # Add tools if provided
-    opts_with_tools =
+     opts_with_tools =
       case params[:tools] do
         tools when is_list(tools) and length(tools) > 0 ->
           # Convert tools directly to ReqLLM format
           tool_specs =
-            Enum.map(tools, fn tool ->
-              %{
-                name: tool.name()
-                description: tool.description(),
-                parameters: tool.parameters()
-              }
+            tools
+            |> Enum.map(fn
+              tool when is_atom(tool) -> Jido.AI.Tools.SchemaConverter.action_to_tool(tool)
+              %{} = tool -> tool
+              _ -> nil
             end)
+            |> Enum.reject(&is_nil/1)
 
           Keyword.put(base_opts, :tools, tool_specs)
 
         _ ->
           base_opts
       end
+
 
     # ReqLLM handles authentication internally via environment variables
     {:ok, opts_with_tools}
