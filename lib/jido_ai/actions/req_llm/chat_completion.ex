@@ -237,41 +237,216 @@ defmodule Jido.AI.Actions.ReqLlm.ChatCompletion do
       |> add_opt_if_present(:presence_penalty, params.presence_penalty)
 
     # Add tools if provided
-      opts_with_tools =
+    opts_with_tools =
       case params[:tools] do
         tools when is_list(tools) and length(tools) > 0 ->
-          # Convert tools to ReqLLM format
-          tool_specs =
+          # Convert tools to ReqLLM.Tool structs
+          reqllm_tools =
             tools
             |> Enum.map(fn
+              # Jido.Action module - convert to ReqLLM.Tool
               tool when is_atom(tool) ->
-                openai_tool = Jido.AI.Tools.SchemaConverter.action_to_tool(tool)
-                openai_tool.function
+                convert_action_to_reqllm_tool(tool)
 
-              %{function: %{} = func} = tool ->
-                func
-
-              %{name: _, description: _, parameters: _} = tool ->
+              # Already a ReqLLM.Tool struct
+              %ReqLLM.Tool{} = tool ->
                 tool
 
-              %{} = tool ->
-                tool
+              # Map with function key (OpenAI format) - convert to ReqLLM.Tool
+              %{function: %{name: name, description: description, parameters: parameters}} = tool
+              when is_binary(name) and is_binary(description) ->
+                convert_map_to_reqllm_tool(name, description, parameters)
 
-              _ ->
+              # Map with name, description, parameters (direct format)
+              %{name: name, description: description, parameters: parameters} = tool
+              when is_binary(name) and is_binary(description) and is_map(parameters) ->
+                convert_map_to_reqllm_tool(name, description, parameters)
+
+              # Any other map format - try to extract and convert
+              tool when is_map(tool) ->
+                case extract_tool_info_from_map(tool) do
+                  {name, description, parameters} when is_binary(name) and is_binary(description) ->
+                    convert_map_to_reqllm_tool(name, description, parameters)
+
+                  _ ->
+                    Logger.warning(
+                      "Unable to convert tool map to ReqLLM.Tool: #{inspect(tool, limit: 3)}"
+                    )
+                    nil
+                end
+
+              other ->
+                Logger.warning(
+                  "Invalid tool format, expected Jido.Action module, ReqLLM.Tool struct, or map: #{inspect(other, limit: 3)}"
+                )
                 nil
             end)
             |> Enum.reject(&is_nil/1)
+            |> Enum.filter(fn tool ->
+              case tool do
+                %ReqLLM.Tool{} -> true
+                _ ->
+                  Logger.error(
+                    "Tool conversion failed - expected ReqLLM.Tool struct but got: #{inspect(tool, limit: 3)}"
+                  )
+                  false
+              end
+            end)
 
-          Keyword.put(base_opts, :tools, tool_specs)
+          Keyword.put(base_opts, :tools, reqllm_tools)
 
         _ ->
           base_opts
       end
 
-
     # ReqLLM handles authentication internally via environment variables
     {:ok, opts_with_tools}
   end
+
+  defp convert_action_to_reqllm_tool(action_module) when is_atom(action_module) do
+    name = get_action_name(action_module)
+    description = get_action_description(action_module)
+    parameter_schema = get_action_schema(action_module)
+
+    # Create callback that executes the action
+    callback = fn input ->
+      # Convert input map to params format expected by Jido.Action
+      params = normalize_input_to_params(input)
+      context = %{}
+
+      case action_module.run(params, context) do
+        {:ok, result} -> {:ok, result}
+        {:error, reason} -> {:error, reason}
+        other -> {:ok, other}
+      end
+    end
+
+    case ReqLLM.Tool.new(
+           name: name,
+           description: description,
+           parameter_schema: parameter_schema,
+           callback: callback
+         ) do
+      {:ok, tool} -> tool
+      {:error, reason} ->
+        Logger.error("Failed to create ReqLLM.Tool from #{inspect(action_module)}: #{inspect(reason)}")
+        nil
+    end
+  end
+
+  defp convert_map_to_reqllm_tool(name, description, parameters) do
+    # Convert JSON Schema parameters to NimbleOptions format if needed
+    parameter_schema =
+      if is_map(parameters) do
+        # Assume it's JSON Schema format, convert to NimbleOptions
+        json_schema_to_nimble_options(parameters)
+      else
+        parameters
+      end
+
+    # Create a no-op callback since we don't have the original action
+    callback = fn _input -> {:ok, %{message: "Tool executed"}} end
+
+    case ReqLLM.Tool.new(
+           name: name,
+           description: description,
+           parameter_schema: parameter_schema,
+           callback: callback
+         ) do
+      {:ok, tool} -> tool
+      {:error, reason} ->
+        Logger.error("Failed to create ReqLLM.Tool from map: #{inspect(reason)}")
+        nil
+    end
+  end
+
+  defp extract_tool_info_from_map(%{name: name, description: description, parameters: parameters})
+       when is_binary(name) and is_binary(description) do
+    {name, description, parameters}
+  end
+
+  defp extract_tool_info_from_map(%{function: %{name: name, description: description, parameters: parameters}})
+       when is_binary(name) and is_binary(description) do
+    {name, description, parameters}
+  end
+
+  defp extract_tool_info_from_map(_), do: nil
+
+  defp get_action_name(action_module) do
+    if function_exported?(action_module, :name, 0) do
+      action_module.name()
+    else
+      action_module
+      |> Module.split()
+      |> List.last()
+      |> Macro.underscore()
+    end
+  end
+
+  defp get_action_description(action_module) do
+    if function_exported?(action_module, :description, 0) do
+      action_module.description()
+    else
+      "No description available"
+    end
+  end
+
+  defp get_action_schema(action_module) do
+    if function_exported?(action_module, :schema, 0) do
+      action_module.schema()
+    else
+      []
+    end
+  end
+
+  defp normalize_input_to_params(input) when is_map(input) do
+    # Convert atom keys to strings if needed, or keep as is
+    Map.new(input, fn
+      {key, value} when is_atom(key) -> {Atom.to_string(key), value}
+      {key, value} -> {key, value}
+    end)
+  end
+
+  defp normalize_input_to_params(input), do: input
+
+  defp json_schema_to_nimble_options(%{"type" => "object", "properties" => properties} = schema) do
+    required = Map.get(schema, "required", [])
+
+    Enum.map(properties, fn {key, prop} ->
+      atom_key = String.to_atom(key)
+
+      opts = [
+        type: json_type_to_nimble_type(Map.get(prop, "type", "string")),
+        required: key in required
+      ]
+
+      opts =
+        if Map.has_key?(prop, "description") do
+          Keyword.put(opts, :doc, Map.get(prop, "description"))
+        else
+          opts
+        end
+
+      opts =
+        if Map.has_key?(prop, "default") do
+          Keyword.put(opts, :default, Map.get(prop, "default"))
+        else
+          opts
+        end
+
+      {atom_key, opts}
+    end)
+  end
+
+  defp json_schema_to_nimble_options(_), do: []
+
+  defp json_type_to_nimble_type("string"), do: :string
+  defp json_type_to_nimble_type("integer"), do: :integer
+  defp json_type_to_nimble_type("number"), do: :float
+  defp json_type_to_nimble_type("boolean"), do: :boolean
+  defp json_type_to_nimble_type("array"), do: {:list, :any}
+  defp json_type_to_nimble_type("object"), do: :map
+  defp json_type_to_nimble_type(_), do: :string
 
   defp add_opt_if_present(opts, _key, nil), do: opts
   defp add_opt_if_present(opts, key, value), do: Keyword.put(opts, key, value)
